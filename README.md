@@ -58,12 +58,9 @@ Output : ΔCOM (T=100, 2)  —  ML (X) and AP (Y) relative displacement in metre
 ├── config.yaml                  # all hyperparameters (model, training)
 ├── dataset.py                   # GaitDataset: loading, preprocessing, NaN exclusion
 ├── model.py                     # all model architectures + MODEL_REGISTRY
-├── train.py                     # train a single model on full dataset
+├── train.py                     # train all (or one) model on the full dataset
 ├── compare_methods.py           # LOOCV across all models; generates CSV and charts
-├── cv_train.py                  # LOOCV for LSTM only (single-model reference)
 ├── eval.py                      # visualise one prediction from a trained model
-├── move.py                      # one-time script: reorganises DataSet/ → data/
-├── load_mat.py                  # utility: inspect raw .mat file contents
 └── README.md
 ```
 
