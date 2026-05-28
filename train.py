@@ -1,16 +1,16 @@
 """
 Final model training script.
 
-Trains a chosen model on the full 106-sample dataset.
+Trains one or all models on the full dataset.
 80/20 random split is used for early stopping only — it is NOT a
 generalization estimate. For held-out generalization metrics, see
 compare_methods.py (Leave-One-Patient-Out CV).
 
 Usage:
-  python train.py                     # default: CNN1D (best from LOOCV)
-  python train.py --model LSTM
+  python train.py                        # train all models (default)
+  python train.py --model CNN1D          # train one model
   python train.py --model ANN --epochs 200
-  python train.py --model CNN1D --seed 0
+  python train.py --seed 0
 """
 
 import argparse
@@ -24,8 +24,8 @@ from model import MODEL_REGISTRY
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("--model",  default="CNN1D", choices=list(MODEL_REGISTRY),
-                    help="Model architecture (default: CNN1D)")
+parser.add_argument("--model",  default=None, choices=list(MODEL_REGISTRY),
+                    help="Model to train (default: all models)")
 parser.add_argument("--epochs", type=int, default=None,
                     help="Override epochs from config.yaml")
 parser.add_argument("--seed",   type=int, default=42)
@@ -40,7 +40,7 @@ EPOCHS = args.epochs or config["train"]["epochs"]
 LR     = config["train"]["lr"]
 BATCH  = config["train"]["batch_size"]
 
-# ── Data ──────────────────────────────────────────────────────────────────────
+# ── Data (shared across all models) ───────────────────────────────────────────
 dataset = GaitDataset(config["train"]["data_path"])
 n_val   = max(1, int(len(dataset) * 0.2))
 n_fit   = len(dataset) - n_val
@@ -51,60 +51,65 @@ fit_set, val_set = random_split(dataset, [n_fit, n_val])
 fit_loader = DataLoader(fit_set, batch_size=BATCH, shuffle=True,  drop_last=False)
 val_loader = DataLoader(val_set, batch_size=BATCH, shuffle=False, drop_last=False)
 
-# ── Model ─────────────────────────────────────────────────────────────────────
-model     = MODEL_REGISTRY[args.model](**config["model"]).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-criterion = torch.nn.MSELoss()
-n_params  = sum(p.numel() for p in model.parameters() if p.requires_grad)
+os.makedirs("weights", exist_ok=True)
 
-print(f"Model   : {args.model}  ({n_params:,} params)")
+models_to_train = [args.model] if args.model else list(MODEL_REGISTRY)
+
 print(f"Device  : {device}")
 print(f"Epochs  : {EPOCHS}  |  LR: {LR}  |  Batch: {BATCH}")
 print(f"Samples : fit={n_fit}  val={n_val}  (seed={args.seed})")
-print()
+print(f"Models  : {models_to_train}\n")
 
 # ── Training loop ─────────────────────────────────────────────────────────────
-os.makedirs("weights", exist_ok=True)
-out_path = f"weights/final_{args.model.lower()}.pth"
+def train_model(model_name):
+    criterion = torch.nn.MSELoss()
+    model     = MODEL_REGISTRY[model_name](**config["model"]).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    n_params  = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-best_val  = float("inf")
-best_state = None
+    print(f"── {model_name}  ({n_params:,} params)")
 
-for epoch in range(EPOCHS):
-    model.train()
-    train_loss = 0.0
-    for inputs, targets in fit_loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad()
-        loss = criterion(model(inputs), targets)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        train_loss += loss.item()
+    best_val   = float("inf")
+    best_state = None
 
-    model.eval()
-    val_loss = 0.0
-    with torch.no_grad():
-        for inputs, targets in val_loader:
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss = 0.0
+        for inputs, targets in fit_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            val_loss += criterion(model(inputs), targets).item()
+            optimizer.zero_grad()
+            loss = criterion(model(inputs), targets)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item()
 
-    avg_train = train_loss / len(fit_loader)
-    avg_val   = val_loss   / len(val_loader)
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                val_loss += criterion(model(inputs), targets).item()
 
-    if avg_val < best_val:
-        best_val   = avg_val
-        best_state = {k: v.clone() for k, v in model.state_dict().items()}
-        saved_mark = " *"
-    else:
-        saved_mark = ""
+        avg_train = train_loss / len(fit_loader)
+        avg_val   = val_loss   / len(val_loader)
 
-    if (epoch + 1) % 10 == 0:
-        print(f"Epoch [{epoch+1:3d}/{EPOCHS}]  "
-              f"train={avg_train:.5f}  val={avg_val:.5f}{saved_mark}")
+        if avg_val < best_val:
+            best_val   = avg_val
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            saved_mark = " *"
+        else:
+            saved_mark = ""
 
-# ── Save ──────────────────────────────────────────────────────────────────────
-model.load_state_dict(best_state)
-torch.save(best_state, out_path)
-print(f"\nBest val MSE : {best_val:.5f}")
-print(f"Weights saved: {out_path}")
+        if (epoch + 1) % 10 == 0:
+            print(f"  Epoch [{epoch+1:3d}/{EPOCHS}]  "
+                  f"train={avg_train:.5f}  val={avg_val:.5f}{saved_mark}")
+
+    model.load_state_dict(best_state)
+    out_path = f"weights/final_{model_name.lower()}.pth"
+    torch.save(best_state, out_path)
+    print(f"  Best val MSE: {best_val:.5f}  →  {out_path}\n")
+
+
+for name in models_to_train:
+    train_model(name)

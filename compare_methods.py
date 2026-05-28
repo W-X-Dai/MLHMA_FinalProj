@@ -1,19 +1,4 @@
-"""
-Method comparison via Leave-One-Patient-Out CV (13 patients).
-
-Each of the 13 patients in data/ is a distinct individual.
-One patient is held out as test per fold; the remaining 12 train.
-Within each training fold, 20% is reserved as a validation set for
-early stopping so the test fold never influences model selection.
-
-Models compared:  ANN | RNN | LSTM | Transformer | CNN1D
-Metrics reported: MSE (m²) | RMSE_X (mm) | RMSE_Y (mm) | r_X | r_Y
-Output:           compare_results.csv  +  compare_results.png
-
-Resume behaviour: if compare_results.csv already exists, models that
-already have all 13 folds recorded are skipped (no re-training).
-"""
-
+import argparse
 import csv
 import os
 import yaml
@@ -25,6 +10,12 @@ from torch.utils.data import DataLoader, Subset
 
 from dataset import GaitDataset
 from model import MODEL_REGISTRY
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser()
+parser.add_argument("--plot", action="store_true",
+                    help="Save per-fold prediction plots to results/")
+args = parser.parse_args()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 with open("config.yaml") as f:
@@ -38,7 +29,8 @@ MODEL_CFG  = config["model"]
 
 os.makedirs("weights", exist_ok=True)
 
-print(f"Device: {DEVICE}  |  Epochs: {EPOCHS}  |  Models: {list(MODEL_REGISTRY)}\n")
+print(f"Device: {DEVICE}  |  Epochs: {EPOCHS}  |  Models: {list(MODEL_REGISTRY)}")
+print(f"Per-fold plots: {'enabled' if args.plot else 'disabled (pass --plot to enable)'}\n")
 
 # ── Resume: load any already-completed folds from CSV ─────────────────────────
 csv_path    = "compare_results.csv"
@@ -237,10 +229,27 @@ def eval_metrics(model, loader, test_idx):
 results  = {}
 n_params = {}
 
+def _get_fold_model(model_cls, model_name, fold_i, train_idx, test_idx):
+    """Return (model, test_loader), training from scratch if fold weight missing."""
+    weight_path = f"weights/{model_name.lower()}_fold{fold_i+1:02d}.pth"
+    test_loader = DataLoader(Subset(full_dataset, test_idx), batch_size=BATCH_SIZE)
+    if os.path.exists(weight_path):
+        m = model_cls(**MODEL_CFG).to(DEVICE)
+        m.load_state_dict(torch.load(weight_path, map_location=DEVICE))
+        m.eval()
+        return m, test_loader
+    # weight missing — retrain this fold
+    print("    (fold weight missing, retraining ...)", flush=True)
+    m, test_loader, _, _ = train_one_fold(model_cls, train_idx, test_idx)
+    torch.save(m.state_dict(), weight_path)
+    return m, test_loader
+
+
 for model_name, model_cls in MODEL_REGISTRY.items():
     n_params[model_name] = count_params(model_cls(**MODEL_CFG))
 
-    if len(completed.get(model_name, {})) == N_FOLDS:
+    all_cached = len(completed.get(model_name, {})) == N_FOLDS
+    if all_cached and not args.plot:
         print(f"[skip] {model_name} — all {N_FOLDS} folds already in CSV")
         results[model_name] = [completed[model_name][i] for i in range(N_FOLDS)]
         continue
@@ -253,10 +262,13 @@ for model_name, model_cls in MODEL_REGISTRY.items():
     for fold_i, (test_pid, train_idx, test_idx) in enumerate(folds):
         if fold_i in completed.get(model_name, {}):
             metrics = completed[model_name][fold_i]
-            mse, rx, ry, r_x, r_y = metrics
+            mse, rx, ry, r_x, r_y, ang, nx, ny = metrics
             print(f"  Fold {fold_i+1:>2}/{N_FOLDS} (test={test_pid}) [cached]  "
                   f"RMSE_X={rx:.1f}mm  RMSE_Y={ry:.1f}mm  r_X={r_x:.3f}  r_Y={r_y:.3f}")
             fold_metrics.append(metrics)
+            if args.plot:
+                m, tl = _get_fold_model(model_cls, model_name, fold_i, train_idx, test_idx)
+                plot_fold(m, tl, model_name, fold_i, test_pid)
             continue
 
         print(f"  Fold {fold_i+1:>2}/{N_FOLDS} (test={test_pid}) ...",
@@ -264,7 +276,8 @@ for model_name, model_cls in MODEL_REGISTRY.items():
         model, test_loader, n_fit, n_val = train_one_fold(model_cls, train_idx, test_idx)
         print(f"fit={n_fit} val={n_val} test={len(test_idx)}", end="  ", flush=True)
         metrics = eval_metrics(model, test_loader, test_idx)
-        plot_fold(model, test_loader, model_name, fold_i, test_pid)
+        if args.plot:
+            plot_fold(model, test_loader, model_name, fold_i, test_pid)
         fold_metrics.append(metrics)
         mse, rx, ry, r_x, r_y, ang, nx, ny = metrics
         print(f"RMSE_X={rx:.1f}mm  RMSE_Y={ry:.1f}mm  "
